@@ -1,0 +1,92 @@
+name: CI - Build and Push to ECR
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: write  # needed to commit Helm values updates
+  id-token: write  # needed for OIDC-based AWS authentication
+
+jobs:
+  # ─────────────────────────────────────────────
+  # STAGE 1: Detect which services changed
+  # ─────────────────────────────────────────────
+  detect-changes:
+    name: Detect Changed Services
+    runs-on: ubuntu-latest
+    outputs:
+      cart:      ${{ steps.changes.outputs.cart }}
+      catalog:   ${{ steps.changes.outputs.catalog }}
+      checkout:  ${{ steps.changes.outputs.checkout }}
+      orders:    ${{ steps.changes.outputs.orders }}
+      ui:        ${{ steps.changes.outputs.ui }}
+      matrix:    ${{ steps.build-matrix.outputs.matrix }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history required for accurate diff
+
+      - name: Detect file changes per service
+        id: changes
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            cart:
+              - 'src/cart/**'
+            catalog:
+              - 'src/catalog/**'
+            checkout:
+              - 'src/checkout/**'
+            orders:
+              - 'src/orders/**'
+            ui:
+              - 'src/ui/**'
+
+      - name: Build dynamic service matrix
+        id: build-matrix
+        run: |
+          services=()
+          if [ "${{ steps.changes.outputs.cart }}"     = "true" ]; then services+=('{"service":"cart",    "context":"src/cart",     "values_file":"src/cart/chart/values.yaml"}'); fi
+          if [ "${{ steps.changes.outputs.catalog }}"  = "true" ]; then services+=('{"service":"catalog", "context":"src/catalog",  "values_file":"src/catalog/chart/values.yaml"}'); fi
+          if [ "${{ steps.changes.outputs.checkout }}" = "true" ]; then services+=('{"service":"checkout","context":"src/checkout","values_file":"src/checkout/chart/values.yaml"}'); fi
+          if [ "${{ steps.changes.outputs.orders }}"   = "true" ]; then services+=('{"service":"orders",  "context":"src/orders",   "values_file":"src/orders/chart/values.yaml"}'); fi
+          if [ "${{ steps.changes.outputs.ui }}"       = "true" ]; then services+=('{"service":"ui",      "context":"src/ui",       "values_file":"src/ui/chart/values.yaml"}'); fi
+
+          if [ ${#services[@]} -eq 0 ]; then
+            echo "No service changes detected — skipping build."
+            echo 'matrix={"include":[]}' >> "$GITHUB_OUTPUT"
+          else
+            # Join array elements with commas and wrap in {"include":[...]}
+            joined=$(printf '%s,' "${services[@]}")
+            joined="${joined%,}"  # strip trailing comma
+            echo "matrix={\"include\":[$joined]}" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ─────────────────────────────────────────────
+  # STAGE 2: Build, push to ECR, update Helm tag
+  # Runs in parallel for each changed service
+  # ─────────────────────────────────────────────
+  build-and-push:
+    name: Build & Push — ${{ matrix.service }}
+    needs: detect-changes
+    if: ${{ needs.detect-changes.outputs.matrix != '{"include":[]}' }}
+    strategy:
+      matrix: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
+      fail-fast: false   # let other services continue if one fails
+    uses: ./.github/workflows/reusable-build-push.yaml
+    with:
+      service:      ${{ matrix.service }}
+      context:      ${{ matrix.context }}
+      values_file:  ${{ matrix.values_file }}
+      aws_region:   ${{ vars.AWS_REGION }}
+      ecr_registry: ${{ vars.ECR_REGISTRY }}
+      image_tag:    ${{ github.sha }}
+    secrets:
+      aws_role_arn: ${{ secrets.AWS_ROLE_ARN }}

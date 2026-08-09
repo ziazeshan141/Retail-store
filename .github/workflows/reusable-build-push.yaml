@@ -1,0 +1,153 @@
+name: Reusable — Build, Push to ECR & Update Helm Values
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: "Service name (cart | catalog | checkout | orders | ui)"
+        required: true
+        type: string
+      context:
+        description: "Docker build context path (e.g. src/cart)"
+        required: true
+        type: string
+      values_file:
+        description: "Path to the Helm chart values.yaml to update (e.g. src/cart/chart/values.yaml)"
+        required: true
+        type: string
+      aws_region:
+        description: "AWS region where ECR is hosted (e.g. us-east-1)"
+        required: true
+        type: string
+      ecr_registry:
+        description: "ECR registry host (e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com)"
+        required: true
+        type: string
+      image_tag:
+        description: "Tag to apply to the Docker image (typically the git SHA)"
+        required: true
+        type: string
+    secrets:
+      aws_role_arn:
+        description: "IAM Role ARN to assume via OIDC for ECR access"
+        required: true
+
+jobs:
+  build-push-update:
+    name: "${{ inputs.service }} — build → push → update helm"
+    runs-on: ubuntu-latest
+
+    env:
+      IMAGE_NAME: retail-store-sample-${{ inputs.service }}
+      FULL_IMAGE:  ${{ inputs.ecr_registry }}/retail-store-sample-${{ inputs.service }}
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # token with write permission so we can push the Helm values update
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      # ── 2. AWS Authentication (OIDC — no long-lived keys) ───────────────────
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume:       ${{ secrets.aws_role_arn }}
+          aws-region:           ${{ inputs.aws_region }}
+          role-session-name:    GitHubActions-${{ inputs.service }}-${{ github.run_id }}
+
+      # ── 3. Authenticate Docker with ECR ─────────────────────────────────────
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ── 4. Ensure ECR repository exists (idempotent) ────────────────────────
+      - name: Create ECR repository if it does not exist
+        run: |
+          aws ecr describe-repositories \
+            --repository-names "${{ env.IMAGE_NAME }}" \
+            --region "${{ inputs.aws_region }}" \
+          || aws ecr create-repository \
+            --repository-name "${{ env.IMAGE_NAME }}" \
+            --region "${{ inputs.aws_region }}" \
+            --image-scanning-configuration scanOnPush=true \
+            --image-tag-mutability MUTABLE
+
+      # ── 5. Docker layer cache setup ──────────────────────────────────────────
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ── 6. Build & push image with two tags (SHA + latest) ──────────────────
+      - name: Build and push Docker image
+        id: docker-build
+        uses: docker/build-push-action@v6
+        with:
+          context:    ${{ inputs.context }}
+          file:       ${{ inputs.context }}/Dockerfile
+          push:       true
+          tags: |
+            ${{ env.FULL_IMAGE }}:${{ inputs.image_tag }}
+            ${{ env.FULL_IMAGE }}:latest
+          cache-from: type=gha,scope=${{ inputs.service }}
+          cache-to:   type=gha,scope=${{ inputs.service }},mode=max
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ github.event.head_commit.timestamp }}
+
+      # ── 7. Install yq for YAML editing ──────────────────────────────────────
+      - name: Install yq
+        run: |
+          YQ_VERSION="v4.44.1"
+          wget -qO /usr/local/bin/yq \
+            "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64"
+          chmod +x /usr/local/bin/yq
+
+      # ── 8. Update image.repository and image.tag in Helm values.yaml ────────
+      - name: Update Helm values — image.repository and image.tag
+        run: |
+          echo "Updating ${{ inputs.values_file }}"
+          echo "  image.repository → ${{ env.FULL_IMAGE }}"
+          echo "  image.tag        → ${{ inputs.image_tag }}"
+
+          yq -i '.image.repository = "${{ env.FULL_IMAGE }}"' \
+            "${{ inputs.values_file }}"
+
+          yq -i '.image.tag = "${{ inputs.image_tag }}"' \
+            "${{ inputs.values_file }}"
+
+          echo "─── Updated values.yaml ───"
+          grep -A 3 '^image:' "${{ inputs.values_file }}"
+
+      # ── 9. Commit and push the updated Helm values back to the repo ─────────
+      - name: Commit and push Helm values update
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add "${{ inputs.values_file }}"
+
+          # Only commit if the file actually changed
+          if git diff --cached --quiet; then
+            echo "No changes to commit for ${{ inputs.service }} — values already up to date."
+          else
+            git commit -m "ci(${{ inputs.service }}): update image tag to ${{ inputs.image_tag }} [skip ci]"
+            git push origin HEAD:${{ github.ref_name }}
+            echo "Helm values pushed for ${{ inputs.service }}."
+          fi
+
+      # ── 10. Summary ──────────────────────────────────────────────────────────
+      - name: Write job summary
+        if: always()
+        run: |
+          echo "## ${{ inputs.service }} — Build Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Service | \`${{ inputs.service }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Image | \`${{ env.FULL_IMAGE }}:${{ inputs.image_tag }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Digest | \`${{ steps.docker-build.outputs.digest }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Helm values | \`${{ inputs.values_file }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Triggered by | \`${{ github.actor }}\` on \`${{ github.ref_name }}\` |" >> "$GITHUB_STEP_SUMMARY"
